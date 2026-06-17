@@ -2262,6 +2262,222 @@ Bitte berichten:
         allowed_files={"lib/settings_dialog.dart"},
         forbidden_patterns=["models.json", "api_key", "DEEPSEEK_API_KEY", "Bearer ", "Authorization"],
     ),
+    WorkflowAgentTask(
+        task_id="route_options_store",
+        title="RouteOptions Store Bugfix",
+        weight=5,
+        prompt=r"""# Auftrag: Pure-Dart-RouteOptions-Store-Bugfix
+
+(lokal)
+
+Handy muss nicht angeschlossen sein.
+
+Keine Serveraktion, kein Upload, kein Commit und kein Push.
+
+## Projekt
+fixtures\workflow_agent\route_options_store
+
+## Ziel
+
+In der Datei `lib/route_options_store.dart` hat die Klasse `RouteOptions` mehrere Bugs:
+
+1. **fromJson Mode-Key**: Fehlt der 'mode'-Key oder ist er unbekannt, crasht `fromJson` mit einer Exception. Stattdessen soll auf `RouteMode.fastest` defaulted werden.
+2. **AvoidFlags Serialisierung**: `fromJson` speichert die Avoid-Flags, aber die Deserialisierung kann inkonsistent sein.
+3. **copyWith überschreibt AvoidFlags**: `copyWith` setzt `avoidFlags` auf `const AvoidFlags()` zurück, selbst wenn nur der `mode` geändert werden soll. Es soll die bestehenden Flags erhalten.
+
+Repariere alle Bugs, sodass der Store korrekt funktioniert.
+
+## Agent führt aus
+
+1. Lies `lib/route_options_store.dart`
+2. Lies `test/route_options_store_test.dart`
+3. Repariere die Bugs
+4. Führe Tests aus mit: `dart run test`
+
+## Tests
+
+```bash
+dart run test
+```
+
+Alle 10 Tests müssen PASSED:10/10 ergeben.
+
+## Abschlussbericht
+
+Bitte berichten:
+1. Welche Änderungen du vorgenommen hast
+2. Ob alle Tests grün sind: PASSED:x/y
+
+## Stopp – auf Bestätigung warten
+""",
+        fixture_path="fixtures/workflow_agent/route_options_store",
+        test_command=["dart", "run", "test"],
+        allowed_files={"lib/route_options_store.dart"},
+        forbidden_patterns=["models.json", "api_key", "DEEPSEEK_API_KEY", "Bearer ", "Authorization"],
+    ),
+    WorkflowAgentTask(
+        task_id="favorite_places_store",
+        title="FavoritePlaces Store Bugfix",
+        weight=5,
+        prompt=r"""# Auftrag: Pure-Dart-FavoritePlaces-Store-Bugfix
+
+(lokal)
+
+Handy muss nicht angeschlossen sein.
+
+Keine Serveraktion, kein Upload, kein Commit und kein Push.
+
+## Projekt
+fixtures\workflow_agent\favorite_places_store
+
+## Ziel
+
+In der Datei `lib/favorite_places_store.dart` hat die Klasse `FavoritePlacesStore` mehrere Bugs:
+
+1. **Duplikate**: `add()` fügt Places ohne Duplikat-Check hinzu. Ein Place mit gleichem Namen UND gleichen Koordinaten darf nicht doppelt gespeichert werden.
+2. **Löschen per ID**: `remove()` vergleicht den übergebenen String mit `place.name` statt mit `place.id`. Es soll per ID gelöscht werden.
+3. **JSON-Import**: `importJson()` crasht bei kaputten/null-Einträgen. Solche Einträge sollen übersprungen werden.
+4. **Stabile Reihenfolge**: Nach Löschen eines Eintrags soll die Reihenfolge der verbleibenden Einträge unverändert bleiben.
+
+Repariere alle Bugs, sodass der Store korrekt funktioniert.
+
+## Agent führt aus
+
+1. Lies `lib/favorite_places_store.dart`
+2. Lies `test/favorite_places_store_test.dart`
+3. Repariere die Bugs
+4. Führe Tests aus mit: `dart run test`
+
+## Tests
+
+```bash
+dart run test
+```
+
+Alle 10 Tests müssen PASSED:10/10 ergeben.
+
+## Abschlussbericht
+
+Bitte berichten:
+1. Welche Änderungen du vorgenommen hast
+2. Ob alle Tests grün sind: PASSED:x/y
+
+## Stopp – auf Bestätigung warten
+""",
+        fixture_path="fixtures/workflow_agent/favorite_places_store",
+        test_command=["dart", "run", "test"],
+        allowed_files={"lib/favorite_places_store.dart"},
+        forbidden_patterns=["models.json", "api_key", "DEEPSEEK_API_KEY", "Bearer ", "Authorization"],
+    ),
+    WorkflowAgentTask(
+        task_id="localized_settings_card",
+        title="LocalizedSettingsCard Widget Bugfix",
+        weight=6,
+        prompt=r"""# Auftrag: Flutter-Widget-LocalizedSettings-Bugfix
+
+(lokal)
+
+Handy muss nicht angeschlossen sein.
+
+Keine Serveraktion, kein Upload, kein Commit und kein Push.
+
+## Projekt
+fixtures\workflow_agent\localized_settings_card
+
+## Ziel
+
+In der Datei `lib/localized_settings_card.dart` hat das `LocalizedSettingsCard`-Widget mehrere Bugs:
+
+1. **setState fehlt bei Dropdown**: `onChanged` des DropdownButtonFormField ruft kein `setState` auf – Sprachänderungen werden nicht angezeigt.
+2. **setState fehlt bei Switch**: `onChanged` der SwitchListTile ruft kein `setState` auf – Toggle-Änderungen werden nicht angezeigt.
+3. **Hardcodierter Text**: Der SwitchListTile-Titel ist hardcoded 'Benachrichtigungen' und ignoriert die `_labels`-Map.
+4. **Save-Button**: `onPressed` übergibt hartkodierte Werte `('Deutsch', false)` statt der tatsächlich ausgewählten `_selectedLanguage` und `_notificationsEnabled`.
+5. **Langer Text**: Der Beschreibungstext hat kein `softWrap` oder `maxLines` – er kann unlesbar umbrechen oder abgeschnitten werden.
+
+Repariere alle Bugs, sodass der Dialog korrekt funktioniert.
+
+## Agent führt aus
+
+1. Lies `lib/localized_settings_card.dart`
+2. Lies `test/localized_settings_card_test.dart`
+3. Repariere die Bugs
+4. Führe Tests aus mit: `flutter test`
+
+## Tests
+
+```bash
+flutter test
+```
+
+Alle 8 Tests müssen PASSED:8/8 ergeben.
+
+## Abschlussbericht
+
+Bitte berichten:
+1. Welche Änderungen du vorgenommen hast
+2. Ob alle Tests grün sind: PASSED:x/y
+
+## Stopp – auf Bestätigung warten
+""",
+        fixture_path="fixtures/workflow_agent/localized_settings_card",
+        test_command=["flutter", "test"],
+        allowed_files={"lib/localized_settings_card.dart"},
+        forbidden_patterns=["models.json", "api_key", "DEEPSEEK_API_KEY", "Bearer ", "Authorization"],
+    ),
+    WorkflowAgentTask(
+        task_id="offline_country_list",
+        title="OfflineCountryList Widget Bugfix",
+        weight=6,
+        prompt=r"""# Auftrag: Flutter-Widget-OfflineCountryList-Bugfix
+
+(lokal)
+
+Handy muss nicht angeschlossen sein.
+
+Keine Serveraktion, kein Upload, kein Commit und kein Push.
+
+## Projekt
+fixtures\workflow_agent\offline_country_list
+
+## Ziel
+
+In der Datei `lib/offline_country_list.dart` hat das `OfflineCountryList`-Widget mehrere Bugs:
+
+1. **Planned-Länder**: Länder mit Status `planned` haben einen aktiven Download-Button, sollten aber keinen haben (erst wenn available).
+2. **Available-Länder**: Länder mit Status `available` zeigen nur Text 'Verfügbar' statt eines Download-Buttons. Sie brauchen eine aktive Download-Aktion.
+3. **Installed-Länder**: Länder mit Status `installed` zeigen nur Text 'Installiert' statt Öffnen/Löschen-Buttons.
+4. **Keine Fake-Produktionsbehauptung**: Es darf kein Text wie "echte Deutschlandkarte installiert" auftauchen.
+
+Repariere die `_buildAction`-Methode, sodass jeder Status die korrekte Aktion anzeigt.
+
+## Agent führt aus
+
+1. Lies `lib/offline_country_list.dart`
+2. Lies `test/offline_country_list_test.dart`
+3. Repariere die `_buildAction`-Methode
+4. Führe Tests aus mit: `flutter test`
+
+## Tests
+
+```bash
+flutter test
+```
+
+Alle 8 Tests müssen PASSED:8/8 ergeben.
+
+## Abschlussbericht
+
+Bitte berichten:
+1. Welche Änderungen du vorgenommen hast
+2. Ob alle Tests grün sind: PASSED:x/y
+
+## Stopp – auf Bestätigung warten
+""",
+        fixture_path="fixtures/workflow_agent/offline_country_list",
+        test_command=["flutter", "test"],
+        allowed_files={"lib/offline_country_list.dart"},
+        forbidden_patterns=["models.json", "api_key", "DEEPSEEK_API_KEY", "Bearer ", "Authorization"],
+    ),
 ]
 
 
