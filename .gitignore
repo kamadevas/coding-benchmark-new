@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.env.*
+.envrc
+venv/
+.venv/
+
+# Benchmark output
+llm_benchmark_*.json
+llm_benchmark_*.csv
+results/
+exports/
+tmp/
+temp/
+
+# Local state
+leaderboard.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
