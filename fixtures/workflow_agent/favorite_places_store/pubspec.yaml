@@ -1,6 +1,0 @@
-name: favorite_places_store
-publish_to: none
-environment:
-  sdk: '>=3.0.0 <4.0.0'
-dev_dependencies:
-  test: ^1.24.0
