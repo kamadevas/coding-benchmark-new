@@ -2614,67 +2614,250 @@ def _resolve_flutter_exe() -> str:
 #  Workflow-Agent Evaluierung
 # ============================================================
 
-def run_workflow_agent_evaluation(task: WorkflowAgentTask, base_dir: Path) -> dict[str, Any]:
+WORKFLOW_AGENT_RUNS_DIR = "runs/workflow_agent"
+
+
+def _validate_git_repo(base_dir: Path) -> tuple[bool, str, Path | None]:
+    """Prüft, ob base_dir in einem gültigen Git-Repository liegt.
+
+    Returns:
+        (is_valid, error_message, git_toplevel)
+    """
+    git_toplevel: Path | None = None
+    # Prüfe .git-Ordner oder git rev-parse --show-toplevel
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10, cwd=str(base_dir),
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            git_toplevel = Path(proc.stdout.strip()).resolve()
+        else:
+            return (False, "Dieser Ordner ist kein gültiges Git-Repository.\nBitte zuerst einen Workflow-Agent-Arbeitsordner erzeugen oder den richtigen Ordner auswählen.", None)
+    except FileNotFoundError:
+        return (False, "Git ist nicht installiert oder nicht im PATH.\nGit wird für die Workflow-Agent-Auswertung benötigt.", None)
+    except Exception as exc:
+        return (False, f"Fehler beim Prüfen des Git-Repositories:\n{exc}", None)
+
+    # Prüfe, ob base_dir innerhalb des git_toplevel liegt
+    try:
+        base_resolved = base_dir.resolve()
+        if not str(base_resolved).startswith(str(git_toplevel)):
+            return (False, "Der Arbeitsordner liegt nicht innerhalb des Git-Repositories.", None)
+    except Exception:
+        return (False, "Konnte den Arbeitsordner nicht auflösen.", None)
+
+    return (True, "", git_toplevel)
+
+
+def _check_original_fixtures_modified(fixture_path: Path) -> tuple[bool, list[str]]:
+    """Prüft, ob die Original-Fixtures modifiziert wurden.
+
+    Returns:
+        (modified, changed_files_list)
+    """
+    changed: list[str] = []
+    if not fixture_path.exists():
+        return (False, changed)
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=15, cwd=str(fixture_path),
+        )
+        for line in proc.stdout.splitlines():
+            if line.strip():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) >= 2:
+                    changed.append(parts[1].strip())
+    except Exception:
+        pass
+    return (len(changed) > 0, changed)
+
+
+def _create_run_workdir(task: WorkflowAgentTask, base_dir: Path) -> Path:
+    """Erzeugt einen Run-Arbeitsordner unter runs/workflow_agent/<timestamp>_<task_id>/
+    und kopiert das Fixture dorthin.
+
+    Returns:
+        Pfad zum erstellten Run-Arbeitsordner.
+    """
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = base_dir / WORKFLOW_AGENT_RUNS_DIR / f"{timestamp}_{task.task_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    fixture_src = base_dir / task.fixture_path
+    if fixture_src.exists():
+        # Kopiere alle Dateien aus dem Fixture-Ordner rekursiv
+        _copy_fixture_tree(fixture_src, run_dir)
+
+    return run_dir
+
+
+def _copy_fixture_tree(src: Path, dst: Path) -> None:
+    """Kopiert einen Verzeichnisbaum rekursiv, überspringt .git/.dart_tool."""
+    if not src.is_dir():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.name in (".git", ".dart_tool", ".packages", "build"):
+            continue
+        target = dst / item.name
+        if item.is_dir():
+            _copy_fixture_tree(item, target)
+        else:
+            shutil.copy2(item, target)
+
+
+def run_workflow_agent_evaluation(
+    task: WorkflowAgentTask,
+    base_dir: Path,
+    run_workdir: Path | None = None,
+) -> dict[str, Any]:
     """Wertet einen Workflow-Agent-Lauf aus.
 
     Prüft:
+    - Git-Repository gültig
+    - Arbeitsordner existiert
+    - pubspec.yaml existiert
+    - Testdatei existiert
+    - Git verfügbar
+    - dart/flutter im PATH
     - Tests grün (PASSED:x/y im Output)
     - git diff --check (keine Merge-Konflikte)
     - Geänderte Dateien innerhalb des erlaubten Scopes
     - Keine verbotenen Dateien geändert
-    - Keine models.json/API-Key-Leaks
-    - Optional: analyze
+    - Original-Fixtures nicht modifiziert
+    - Keine Dateien außerhalb des Arbeitsordners geändert
     """
-    fixture_path = base_dir / task.fixture_path
-    if not fixture_path.exists():
-        return {
-            "task_id": task.task_id, "title": task.title, "weight": task.weight,
-            "fraction": None, "error_status": "fixture_not_found",
-            "test_result": None, "scope_violations": [], "forbidden_actions": [],
-            "changed_files": [],
+    base_result = {
+        "task_id": task.task_id,
+        "title": task.title,
+        "weight": task.weight,
+        "workdir": str(run_workdir) if run_workdir else None,
+        "fixture_source": str(base_dir / task.fixture_path),
+        "tests_exit_code": None,
+        "diff_check_exit_code": None,
+        "git_valid": True,
+        "original_fixture_modified": False,
+        "error_status": None,
+        "fraction": None,
+        "workflow_agent_score": None,
+        "scope_violations": [],
+        "forbidden_actions": [],
+        "changed_files": [],
+        "test_result": None,
+    }
+
+    # --- 0. Git-Repository prüfen ---
+    git_valid, git_error, git_toplevel = _validate_git_repo(base_dir)
+    if not git_valid:
+        base_result["git_valid"] = False
+        base_result["error_status"] = "git_invalid"
+        base_result["test_result"] = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": git_error}
+        return base_result
+
+    # --- Kein Run-Arbeitsordner → sofort abbrechen, kein Fixture-Fallback ---
+    if run_workdir is None:
+        base_result["git_valid"] = git_valid
+        base_result["error_status"] = "workdir_missing"
+        base_result["test_result"] = {
+            "passed_checks": 0, "total_checks": 0, "fraction": None,
+            "output": "Kein Run-Arbeitsordner unter runs/workflow_agent/ gefunden.\n"
+                      "Bitte zuerst einen Arbeitsordner über »Auftrag anzeigen« erzeugen "
+                      "und den Agent-Lauf durchführen.\n"
+                      "Die Original-Fixtures unter fixtures/workflow_agent/ sind nur Templates "
+                      "und werden nicht ausgewertet.",
         }
+        return base_result
+
+    # --- 1. Prüfen, ob Original-Fixtures modifiziert wurden ---
+    fixture_path = base_dir / task.fixture_path
+    if fixture_path.exists():
+        orig_modified, orig_changed = _check_original_fixtures_modified(fixture_path)
+        if orig_modified:
+            base_result["original_fixture_modified"] = True
+            base_result["forbidden_actions"].append(
+                f"Original-Fixture wurde verändert: {', '.join(orig_changed[:10])}"
+            )
+
+    # --- Bestimme den Auswertungsordner ---
+    workdir = run_workdir
+
+    # --- 2. Prüfe, ob der Arbeitsordner existiert ---
+    if not workdir.exists():
+        base_result["error_status"] = "workdir_missing"
+        base_result["test_result"] = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"Arbeitsordner fehlt: {workdir}"}
+        return base_result
+
+    # --- 3. Prüfe, ob pubspec.yaml existiert ---
+    pubspec = workdir / "pubspec.yaml"
+    if not pubspec.is_file():
+        base_result["error_status"] = "pubspec_missing"
+        base_result["test_result"] = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"pubspec.yaml fehlt in: {workdir}"}
+        return base_result
+
+    # --- 4. Prüfe, ob Testdatei existiert ---
+    test_dir = workdir / "test"
+    if not test_dir.is_dir() or not any(test_dir.iterdir()):
+        base_result["error_status"] = "test_file_missing"
+        base_result["test_result"] = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"Keine Testdateien gefunden in: {test_dir}"}
+        return base_result
 
     scope_violations: list[str] = []
-    forbidden_actions: list[str] = []
+    forbidden_actions: list[str] = list(base_result["forbidden_actions"])
     changed_files: list[str] = []
+    diff_check_exit_code: int | None = None
+    git_available = True
 
-    # 1. git diff --check & geänderte Dateien ermitteln
+    # --- 5. git diff --check & geänderte Dateien ermitteln ---
     try:
-        subprocess.run(
+        diff_proc = subprocess.run(
             ["git", "diff", "--check"],
-            capture_output=True, text=True, timeout=15, cwd=str(fixture_path),
+            capture_output=True, text=True, timeout=15, cwd=str(workdir),
         )
+        diff_check_exit_code = diff_proc.returncode
+    except FileNotFoundError:
+        git_available = False
     except Exception:
-        pass
+        diff_check_exit_code = -1
 
-    # 2. Geänderte Dateien via git diff --name-only
-    try:
-        name_proc = subprocess.run(
-            ["git", "diff", "--name-only"],
-            capture_output=True, text=True, timeout=15, cwd=str(fixture_path),
-        )
-        changed = [line.strip() for line in name_proc.stdout.splitlines() if line.strip()]
-        changed_files = changed
-    except Exception:
-        changed = []
+    # 6. Geänderte Dateien via git diff --name-only
+    if git_available:
+        try:
+            name_proc = subprocess.run(
+                ["git", "diff", "--name-only"],
+                capture_output=True, text=True, timeout=15, cwd=str(workdir),
+            )
+            changed = [line.strip() for line in name_proc.stdout.splitlines() if line.strip()]
+            changed_files = changed
+        except Exception:
+            changed = []
 
-    # Auch unstaged/untracked via git status
-    try:
-        status_proc = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=15, cwd=str(fixture_path),
-        )
-        for line in status_proc.stdout.splitlines():
-            if line.strip():
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) >= 2:
-                    fname = parts[1].strip()
-                    if fname not in changed_files:
-                        changed_files.append(fname)
-    except Exception:
-        pass
+        # Auch unstaged/untracked via git status
+        try:
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=15, cwd=str(workdir),
+            )
+            for line in status_proc.stdout.splitlines():
+                if line.strip():
+                    parts = line.strip().split(maxsplit=1)
+                    if len(parts) >= 2:
+                        fname = parts[1].strip()
+                        if fname not in changed_files:
+                            changed_files.append(fname)
+        except Exception:
+            pass
 
-    # 3. Scope-Prüfung: Geänderte Dateien außerhalb erlaubter Files?
+    # --- 7. Prüfe: Wurden überhaupt Dateien geändert? ---
+    if not changed_files and run_workdir:
+        # Keine Änderungen im Run-Ordner – Agent hat nichts getan
+        base_result["error_status"] = "no_files_changed"
+        base_result["test_result"] = {"passed_checks": 0, "total_checks": 0, "fraction": 0.0, "output": "Keine Dateien wurden geändert. Der Agent hat keine Änderungen vorgenommen."}
+        return base_result
+
+    # --- 8. Scope-Prüfung: Geänderte Dateien außerhalb erlaubter Files? ---
     for f in changed_files:
         normalized = f.replace("\\", "/")
         is_allowed = False
@@ -2687,9 +2870,9 @@ def run_workflow_agent_evaluation(task: WorkflowAgentTask, base_dir: Path) -> di
         if not is_allowed:
             scope_violations.append(f)
 
-    # 4. Prüfe auf verbotene Patterns in geänderten Dateien
+    # --- 9. Prüfe auf verbotene Patterns in geänderten Dateien ---
     for f in changed_files:
-        file_path = fixture_path / f
+        file_path = workdir / f
         if not file_path.is_file():
             continue
         try:
@@ -2700,46 +2883,57 @@ def run_workflow_agent_evaluation(task: WorkflowAgentTask, base_dir: Path) -> di
         except Exception:
             pass
 
-    # 5. Test-Auswertung
+    # --- 10. Test-Auswertung ---
     test_result: dict[str, Any] | None = None
     fraction: float | None = None
-    error_status: str | None = None
+    error_status: str | None = base_result["error_status"]
+    tests_exit_code: int | None = None
 
     test_cmd = task.test_command
-    try:
-        proc = subprocess.run(
-            test_cmd,
-            capture_output=True, text=True, timeout=120, cwd=str(fixture_path),
-            shell=(sys.platform == "win32"),
-        )
-        stdout = proc.stdout + proc.stderr
-        match = re.search(r"PASSED:(\d+)/(\d+)", stdout)
-        if match:
-            passed_checks = int(match.group(1))
-            total_checks = int(match.group(2))
-            fraction = passed_checks / total_checks if total_checks > 0 else 0.0
-        else:
-            passed_checks = 0
-            total_checks = 0
+    # Prüfe, ob dart/flutter verfügbar ist
+    exe_name = test_cmd[0] if test_cmd else ""
+    if exe_name and shutil.which(exe_name) is None:
+        error_status = error_status or f"{exe_name}_not_found"
+        test_result = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"{exe_name} nicht im PATH gefunden. Bitte sicherstellen, dass {exe_name} installiert und im PATH ist."}
+    else:
+        try:
+            proc = subprocess.run(
+                test_cmd,
+                capture_output=True, text=True, timeout=120, cwd=str(workdir),
+                shell=(sys.platform == "win32"),
+            )
+            tests_exit_code = proc.returncode
+            stdout = proc.stdout + proc.stderr
+            match = re.search(r"PASSED:(\d+)/(\d+)", stdout)
+            if match:
+                passed_checks = int(match.group(1))
+                total_checks = int(match.group(2))
+                fraction = passed_checks / total_checks if total_checks > 0 else 0.0
+            else:
+                passed_checks = 0
+                total_checks = 0
+                fraction = 0.0
+                if proc.returncode != 0:
+                    error_status = error_status or "tests_failed"
+            test_result = {
+                "passed_checks": passed_checks,
+                "total_checks": total_checks,
+                "fraction": fraction,
+                "output": stdout[-2000:],
+                "exit_code": tests_exit_code,
+            }
+        except subprocess.TimeoutExpired:
+            error_status = error_status or "timeout"
+            test_result = {"passed_checks": 0, "total_checks": 0, "fraction": 0.0, "output": "Timeout", "exit_code": None}
             fraction = 0.0
-        test_result = {
-            "passed_checks": passed_checks,
-            "total_checks": total_checks,
-            "fraction": fraction,
-            "output": stdout[-2000:],
-        }
-    except subprocess.TimeoutExpired:
-        error_status = "timeout"
-        test_result = {"passed_checks": 0, "total_checks": 0, "fraction": 0.0, "output": "Timeout"}
-        fraction = 0.0
-    except FileNotFoundError:
-        error_status = "test_command_not_found"
-        test_result = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"Command not found: {' '.join(test_cmd)}"}
-    except Exception as exc:
-        error_status = "benchmark_runtime_error"
-        test_result = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": str(exc)[:2000]}
+        except FileNotFoundError:
+            error_status = error_status or "test_command_not_found"
+            test_result = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": f"Command not found: {' '.join(test_cmd)}", "exit_code": None}
+        except Exception as exc:
+            error_status = error_status or "benchmark_runtime_error"
+            test_result = {"passed_checks": 0, "total_checks": 0, "fraction": None, "output": str(exc)[:2000], "exit_code": None}
 
-    # 6. Scope-Violations und Forbidden-Actions reduzieren den Score
+    # --- 11. Scope-Violations und Forbidden-Actions reduzieren den Score ---
     workflow_score = fraction
     if fraction is not None and fraction > 0:
         if scope_violations:
@@ -2753,13 +2947,19 @@ def run_workflow_agent_evaluation(task: WorkflowAgentTask, base_dir: Path) -> di
         "task_id": task.task_id,
         "title": task.title,
         "weight": task.weight,
+        "workdir": str(workdir),
+        "fixture_source": str(fixture_path),
+        "tests_exit_code": tests_exit_code,
+        "diff_check_exit_code": diff_check_exit_code,
+        "git_valid": git_valid,
+        "original_fixture_modified": base_result["original_fixture_modified"],
+        "error_status": error_status,
         "fraction": fraction,
         "workflow_agent_score": workflow_score,
         "scope_violations": scope_violations,
         "forbidden_actions": forbidden_actions,
         "changed_files": changed_files,
         "test_result": test_result,
-        "error_status": error_status,
     }
 
 
@@ -3624,16 +3824,30 @@ class ModelTestSlot:
         self.progress.pack(fill=X, pady=(4, 0))
 
     def show_workflow_prompt(self) -> None:
-        """Zeigt den Auftragstext für den Workflow-Agent in einem Popup an."""
+        """Zeigt den Auftragstext für den Workflow-Agent in einem Popup an.
+        Erzeugt vorher einen Run-Arbeitsordner und bettet dessen Pfad in den Prompt ein."""
         if not WORKFLOW_AGENT_TASKS:
             messagebox.showinfo("Keine Aufgaben", "Es sind keine Workflow-Agent-Aufgaben definiert.")
+            return
+
+        base_dir = Path.cwd()
+
+        # Git-Repository-Prüfung
+        git_valid, git_error, _git_toplevel = _validate_git_repo(base_dir)
+        if not git_valid:
+            messagebox.showerror(
+                "Kein gültiges Git-Repository",
+                f"{git_error}\n\n"
+                "Die Workflow-Agent-Funktion benötigt ein gültiges Git-Repository.\n"
+                "Bitte zuerst einen Workflow-Agent-Arbeitsordner erzeugen oder den richtigen Ordner auswählen.",
+            )
             return
 
         # Auswahl-Dialog: Welche Aufgabe?
         task_names = [t.title for t in WORKFLOW_AGENT_TASKS]
         dialog = Toplevel(self.frame)
         dialog.title("Workflow-Agent Auftrag")
-        dialog.geometry("700x500")
+        dialog.geometry("750x550")
         dialog.resizable(True, True)
 
         ttk.Label(dialog, text="Aufgabe auswählen:", font=("", 10, "bold")).pack(fill=X, padx=8, pady=(8, 4))
@@ -3641,17 +3855,41 @@ class ModelTestSlot:
         task_combo = ttk.Combobox(dialog, textvariable=task_var, values=task_names, state="readonly", width=60)
         task_combo.pack(fill=X, padx=8, pady=(0, 8))
 
+        # Info-Label für den Arbeitsordner
+        workdir_var = StringVar(value="")
+        workdir_label = ttk.Label(dialog, textvariable=workdir_var, foreground="#005a9e", font=("", 9, "bold"))
+        workdir_label.pack(fill=X, padx=8, pady=(0, 4))
+
         text_frame = ttk.Frame(dialog)
         text_frame.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
-        prompt_text = tk_text_widget(text_frame, wrap="word", width=80, height=20)
+        prompt_text = tk_text_widget(text_frame, wrap="word", width=80, height=18)
         prompt_text.pack(fill=BOTH, expand=True)
+
+        def _build_full_prompt(task: WorkflowAgentTask, workdir: Path) -> str:
+            """Baut den vollständigen Auftragstext mit Arbeitsordner-Info."""
+            workdir_abs = str(workdir.resolve())
+            header = (
+                f"Arbeitsordner:\n"
+                f"{workdir_abs}\n"
+                f"\n"
+                f"Nur in diesem Arbeitsordner arbeiten.\n"
+                f"Nicht die Original-Fixtures unter fixtures/workflow_agent ändern.\n"
+                f"Keine Dateien außerhalb dieses Arbeitsordners ändern.\n"
+                f"\n"
+            )
+            return header + task.prompt
 
         def update_text(*_args: Any) -> None:
             selected = task_var.get()
             for t in WORKFLOW_AGENT_TASKS:
                 if t.title == selected:
+                    # Run-Arbeitsordner erzeugen
+                    workdir = _create_run_workdir(t, base_dir)
+                    workdir_var.set(f"Arbeitsordner: {workdir.resolve()}")
+                    full_prompt = _build_full_prompt(t, workdir)
+                    prompt_text.config(state="normal")
                     prompt_text.delete("1.0", END)
-                    prompt_text.insert("1.0", t.prompt)
+                    prompt_text.insert("1.0", full_prompt)
                     prompt_text.config(state="disabled")
                     break
 
@@ -3678,18 +3916,88 @@ class ModelTestSlot:
             return
 
         base_dir = Path.cwd()
+
+        # Git-Repository-Prüfung
+        git_valid, git_error, _git_toplevel = _validate_git_repo(base_dir)
+        if not git_valid:
+            messagebox.showerror(
+                "Kein gültiges Git-Repository",
+                f"{git_error}\n\n"
+                "Die Workflow-Agent-Auswertung benötigt ein gültiges Git-Repository.\n"
+                "Bitte zuerst einen Workflow-Agent-Arbeitsordner erzeugen oder den richtigen Ordner auswählen.",
+            )
+            return
+
         self.status_var.set(f"{self.model.name}: Workflow-Auswertung läuft…")
         self.evaluate_btn.config(state="disabled")
+
+        def _find_latest_run_workdir(task: WorkflowAgentTask) -> Path | None:
+            """Findet den neuesten Run-Arbeitsordner für eine Aufgabe."""
+            runs_base = base_dir / WORKFLOW_AGENT_RUNS_DIR
+            if not runs_base.exists():
+                return None
+            candidates = []
+            for entry in runs_base.iterdir():
+                if entry.is_dir() and entry.name.endswith(f"_{task.task_id}"):
+                    try:
+                        # Extrahiere Timestamp aus dem Ordnernamen (YYYYmmdd_HHMMSS_task_id)
+                        ts_str = entry.name.split("_", 1)[0] + "_" + entry.name.split("_", 2)[1] if len(entry.name.split("_")) >= 2 else ""
+                        candidates.append((entry, entry.stat().st_mtime))
+                    except Exception:
+                        candidates.append((entry, 0))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0][0]
 
         def _run_eval() -> None:
             wf_details = []
             total_weight = 0
             weighted_fraction = 0.0
+            # Fehler-Statuses, die nicht als Modellversagen, sondern als Umgebungsfehler zählen
+            env_error_statuses = BENCHMARK_ERROR_STATUSES | {
+                "test_command_not_found", "fixture_not_found",
+                "git_invalid", "workdir_missing", "pubspec_missing",
+                "dart_not_found", "flutter_not_found",
+                "no_files_changed", "original_fixture_modified",
+            }
+            any_workdir_missing = False
             for task in WORKFLOW_AGENT_TASKS:
-                detail = run_workflow_agent_evaluation(task, base_dir)
+                # Suche nach einem existierenden Run-Arbeitsordner
+                run_workdir = _find_latest_run_workdir(task)
+                if run_workdir:
+                    detail = run_workflow_agent_evaluation(task, base_dir, run_workdir=run_workdir)
+                else:
+                    # Kein Run-Workdir gefunden – direkt workdir_missing, KEIN Fixture-Fallback
+                    any_workdir_missing = True
+                    detail = {
+                        "task_id": task.task_id,
+                        "title": task.title,
+                        "weight": task.weight,
+                        "workdir": None,
+                        "fixture_source": str(base_dir / task.fixture_path),
+                        "tests_exit_code": None,
+                        "diff_check_exit_code": None,
+                        "git_valid": git_valid,
+                        "original_fixture_modified": False,
+                        "error_status": "workdir_missing",
+                        "fraction": None,
+                        "workflow_agent_score": None,
+                        "scope_violations": [],
+                        "forbidden_actions": [],
+                        "changed_files": [],
+                        "test_result": {
+                            "passed_checks": 0, "total_checks": 0, "fraction": None,
+                            "output": "Kein Run-Arbeitsordner unter runs/workflow_agent/ gefunden.\n"
+                                      "Bitte zuerst einen Arbeitsordner über »Auftrag anzeigen« erzeugen "
+                                      "und den Agent-Lauf durchführen.\n"
+                                      "Die Original-Fixtures unter fixtures/workflow_agent/ sind nur Templates "
+                                      "und werden nicht ausgewertet.",
+                        },
+                    }
                 wf_details.append(detail)
                 total_weight += task.weight
-                if detail.get("error_status") not in (BENCHMARK_ERROR_STATUSES | {"test_command_not_found", "fixture_not_found"}):
+                if detail.get("error_status") not in env_error_statuses or detail.get("error_status") is None:
                     wf_score = detail.get("workflow_agent_score")
                     if wf_score is not None:
                         weighted_fraction += task.weight * float(wf_score)
@@ -3697,8 +4005,14 @@ class ModelTestSlot:
 
             result = BenchmarkResult(model=self.model.name)
             result.workflow_agent_percent = wf_percent
+            # Wenn alle WF-Tasks workdir_missing sind, ist das Ergebnis ungültig
+            all_errors = [d.get("error_status") for d in wf_details if d.get("error_status")]
+            if all_errors and all(e in env_error_statuses for e in all_errors):
+                result.benchmark_valid = False
+                result.benchmark_error = "workdir_missing"
             result.details = {
                 "workflow_agent": wf_details,
+                "workdir_missing": any_workdir_missing,
                 "model_config": {
                     "name": self.model.name,
                     "provider": self.model.provider,
@@ -3721,6 +4035,32 @@ class ModelTestSlot:
         self.results.append(result)
         self.evaluate_btn.config(state="normal")
         self.status_var.set(f"{self.model.name}: Workflow-Auswertung abgeschlossen")
+
+        # GUI-Warnung bei fehlenden Run-Arbeitsordnern
+        if result.details.get("workdir_missing") and not result.benchmark_valid:
+            wf_details = result.details.get("workflow_agent", [])
+            missing_tasks = [
+                wf.get("title", wf.get("task_id", "?"))
+                for wf in wf_details
+                if wf.get("error_status") == "workdir_missing"
+            ]
+            task_list = "\n".join(f"  – {t}" for t in missing_tasks) if missing_tasks else "alle Aufgaben"
+            messagebox.showwarning(
+                "Workflow-Agent – Kein Arbeitsordner",
+                f"Kein Run-Arbeitsordner gefunden für:\n{task_list}\n\n"
+                "Bitte zuerst einen Arbeitsordner über »📋 Auftrag anzeigen« erzeugen "
+                "und den Agent-Lauf im erzeugten Ordner unter runs/workflow_agent/ durchführen.\n\n"
+                "Die Original-Fixtures unter fixtures/workflow_agent/ sind nur Templates "
+                "und werden nicht ausgewertet.\n\n"
+                "Ergebnis wurde als nicht bestanden/ungültig markiert.",
+            )
+        elif not result.benchmark_valid:
+            messagebox.showwarning(
+                "Workflow-Agent – Auswertung fehlgeschlagen",
+                f"Workflow-Auswertung fehlgeschlagen: {result.benchmark_error or 'Unbekannter Fehler'}\n\n"
+                "Ergebnis wurde als nicht bestanden/ungültig markiert.",
+            )
+
         self.parent.on_workflow_completed(self, result)
 
     def start(self) -> None:
