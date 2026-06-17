@@ -2661,7 +2661,7 @@ def _check_original_fixtures_modified(fixture_path: Path) -> tuple[bool, list[st
         return (False, changed)
     try:
         proc = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--", str(fixture_path)],
             capture_output=True, text=True, timeout=15, cwd=str(fixture_path),
         )
         for line in proc.stdout.splitlines():
@@ -2672,6 +2672,42 @@ def _check_original_fixtures_modified(fixture_path: Path) -> tuple[bool, list[st
     except Exception:
         pass
     return (len(changed) > 0, changed)
+
+
+def _compare_dirs(fixture_dir: Path, workdir: Path) -> list[str]:
+    """Vergleicht das Fixture mit dem Run-Ordner per direktem Dateivergleich.
+
+    Vergleicht jede Datei byteweise. Gibt relative Pfade der geänderten/neuen
+    Dateien im Arbeitsordner zurück. Ignoriert .dart_tool, .packages, build/.
+    """
+    import filecmp
+    changed: list[str] = []
+
+    for root, dirs, files in os.walk(str(workdir)):
+        # Ignoriere bestimmte Ordner
+        dirs[:] = [d for d in dirs if d not in (".dart_tool", ".packages", "build", ".git")]
+
+        for fname in sorted(files):
+            if fname.endswith(".lock"):
+                # .dart_tool/package_config.json etc. – ignoriere
+                continue
+            run_file = Path(root) / fname
+            rel_path = run_file.relative_to(workdir)
+
+            fixture_file = fixture_dir / rel_path
+            if not fixture_file.exists():
+                changed.append(str(rel_path))
+                continue
+
+            try:
+                run_content = run_file.read_bytes()
+                fix_content = fixture_file.read_bytes()
+                if run_content != fix_content:
+                    changed.append(str(rel_path))
+            except Exception:
+                changed.append(str(rel_path))
+
+    return changed
 
 
 def _create_run_workdir(task: WorkflowAgentTask, base_dir: Path) -> Path:
@@ -2808,22 +2844,23 @@ def run_workflow_agent_evaluation(
     forbidden_actions: list[str] = list(base_result["forbidden_actions"])
     changed_files: list[str] = []
     diff_check_exit_code: int | None = None
-    git_available = True
 
-    # --- 5. git diff --check & geänderte Dateien ermitteln ---
-    try:
-        diff_proc = subprocess.run(
-            ["git", "diff", "--check"],
-            capture_output=True, text=True, timeout=15, cwd=str(workdir),
-        )
-        diff_check_exit_code = diff_proc.returncode
-    except FileNotFoundError:
-        git_available = False
-    except Exception:
-        diff_check_exit_code = -1
+    # --- 5. Prüfe, ob der Workdir ein eigenes Git-Repo ist ---
+    workdir_has_git = (workdir / ".git").exists()
 
-    # 6. Geänderte Dateien via git diff --name-only
-    if git_available:
+    if workdir_has_git:
+        # Git-basierte Änderungserkennung
+        try:
+            diff_proc = subprocess.run(
+                ["git", "diff", "--check"],
+                capture_output=True, text=True, timeout=15, cwd=str(workdir),
+            )
+            diff_check_exit_code = diff_proc.returncode
+        except FileNotFoundError:
+            diff_check_exit_code = -1
+        except Exception:
+            diff_check_exit_code = -1
+
         try:
             name_proc = subprocess.run(
                 ["git", "diff", "--name-only"],
@@ -2834,7 +2871,6 @@ def run_workflow_agent_evaluation(
         except Exception:
             changed = []
 
-        # Auch unstaged/untracked via git status
         try:
             status_proc = subprocess.run(
                 ["git", "status", "--porcelain"],
@@ -2849,6 +2885,12 @@ def run_workflow_agent_evaluation(
                             changed_files.append(fname)
         except Exception:
             pass
+    else:
+        # Kein eigenes Git → direkten Dateivergleich gegen Fixture
+        diff_check_exit_code = 0
+        fixture_src = base_dir / task.fixture_path
+        if fixture_src.exists():
+            changed_files = _compare_dirs(fixture_src, workdir)
 
     # --- 7. Prüfe: Wurden überhaupt Dateien geändert? ---
     if not changed_files and run_workdir:
