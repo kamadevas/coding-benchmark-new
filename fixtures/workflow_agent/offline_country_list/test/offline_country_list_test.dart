@@ -60,38 +60,83 @@ void main() {
       expect(find.text('Schweiz'), findsOneWidget);
     });
 
-    // 3. Planned countries do NOT have an active download button
+    // 3. Planned countries must NOT have an active download button
     await check('planned country has no active download button', () async {
       await pumpList();
-      // Find planned countries: Frankreich, Schweiz
-      // BUG: currently they have a 'Download' button – after fix, they should NOT
-      final downloadButtons = find.text('Download');
-      // With bug: 2 download buttons (for FR and CH)
-      // After fix: 0 download buttons for planned, but 2 for available (DE, AT)
-      // We test: download buttons should exist for available countries only
-      expect(downloadButtons, findsWidgets); // at least some download buttons exist
-    });
-
-    // 4. Available countries have a download action
-    await check('available country triggers download callback', () async {
-      CountryInfo? downloaded;
-      await pumpList(onDownload: (country) => downloaded = country);
-      // Deutschland (available) should have a download button
-      final buttons = find.text('Download');
-      if (buttons.evaluate().isNotEmpty) {
-        await tester.tap(buttons.first);
-        await tester.pump();
-        // Check that the callback was triggered
-        expect(downloaded, isNotNull);
+      // FR and CH are planned – neither may show an active download button
+      for (final code in ['FR', 'CH']) {
+        final tile = find.ancestor(
+          of: find.text(code),
+          matching: find.byType(ListTile),
+        );
+        expect(
+          find.descendant(
+            of: tile,
+            matching: find.widgetWithText(ElevatedButton, 'Download'),
+          ),
+          findsNothing,
+        );
       }
     });
 
-    // 5. Installed countries show installed status
-    await check('installed country shows installed status', () async {
-      await pumpList();
-      // Italien is installed – should show 'Installiert' or open/delete actions
-      expect(find.text('Italien'), findsOneWidget);
-      // After fix, should have open/delete buttons; currently just shows 'Installiert' text
+    // 4. Available country must have a download button that triggers callback
+    await check('available country triggers download callback', () async {
+      CountryInfo? downloaded;
+      await pumpList(onDownload: (c) => downloaded = c);
+
+      // DE is available – must show a download button
+      final tile = find.ancestor(
+        of: find.text('DE'),
+        matching: find.byType(ListTile),
+      );
+      final downloadButton = find.descendant(
+        of: tile,
+        matching: find.widgetWithText(ElevatedButton, 'Download'),
+      );
+      expect(downloadButton, findsOneWidget);
+
+      await tester.tap(downloadButton);
+      await tester.pump();
+      expect(downloaded, isNotNull);
+      expect(downloaded!.code, 'DE');
+    });
+
+    // 5. Installed country must show Öffnen/Löschen and fire callbacks
+    await check('installed country has open and delete actions', () async {
+      CountryInfo? opened;
+      CountryInfo? deleted;
+      await pumpList(
+        onOpen: (c) => opened = c,
+        onDelete: (c) => deleted = c,
+      );
+
+      // IT is installed
+      final tile = find.ancestor(
+        of: find.text('IT'),
+        matching: find.byType(ListTile),
+      );
+
+      final openButton = find.descendant(
+        of: tile,
+        matching: find.text('Öffnen'),
+      );
+      expect(openButton, findsOneWidget);
+
+      final deleteButton = find.descendant(
+        of: tile,
+        matching: find.text('Löschen'),
+      );
+      expect(deleteButton, findsOneWidget);
+
+      await tester.tap(openButton);
+      await tester.pump();
+      expect(opened, isNotNull);
+      expect(opened!.code, 'IT');
+
+      await tester.tap(deleteButton);
+      await tester.pump();
+      expect(deleted, isNotNull);
+      expect(deleted!.code, 'IT');
     });
 
     // 6. Empty list shows placeholder
@@ -110,7 +155,6 @@ void main() {
     // 8. No fake production claim about installed maps
     await check('no fake production claim about real map', () async {
       await pumpList();
-      // There should be no text that claims "echte Deutschlandkarte installiert"
       expect(find.textContaining('echte Deutschlandkarte'), findsNothing);
       expect(find.textContaining('production map'), findsNothing);
       expect(find.textContaining('Produktionskarte'), findsNothing);
